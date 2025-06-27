@@ -132,7 +132,7 @@ func main() {
 	}
 
 	// Validate that max-recursion-depth is only used with watchedDirs
-	if *maxRecursionDepth != 10 && len(*watchedDirs) == 0 {
+	if *maxRecursionDepth != 0 && len(*watchedDirs) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: --max-recursion-depth can only be used with --watched-dirs")
 		os.Exit(2)
 	}
