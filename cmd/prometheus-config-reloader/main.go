@@ -19,10 +19,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	stdlog "log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -48,6 +50,8 @@ const (
 	defaultRetryInterval = 5 * time.Second  // 5 seconds was the value previously hardcoded in github.com/thanos-io/thanos/pkg/reloader.
 	defaultReloadTimeout = 30 * time.Second // 30 seconds was the default value
 
+	defaultMaxRecursionDepth = "0"
+
 	defaultGOMemlimitRatio = "0.0"
 
 	httpReloadMethod   = "http"
@@ -72,6 +76,13 @@ func main() {
 	memlimitRatio := app.Flag("auto-gomemlimit-ratio", "The ratio of reserved GOMEMLIMIT memory to the detected maximum container or system memory. Default: 0 (disabled)").Default(defaultGOMemlimitRatio).Float64()
 
 	watchedDir := app.Flag("watched-dir", "directory to watch non-recursively").Strings()
+
+	watchedDirs := app.Flag("watched-dirs", "directories to watch recursively").Strings()
+
+	maxRecursionDepth := app.Flag(
+		"max-recursion-depth",
+		fmt.Sprintf("maximum depth for recursive directory watching (default: %s)", defaultMaxRecursionDepth)).
+		Default(defaultMaxRecursionDepth).Int()
 
 	reloadMethod := app.Flag("reload-method", "method used to reload the configuration").Default(httpReloadMethod).Enum(httpReloadMethod, signalReloadMethod)
 	processName := app.Flag("process-executable-name", "executable name used to match the process when using the signal reload method").Default("prometheus").String()
@@ -112,6 +123,17 @@ func main() {
 
 	if _, err := app.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stdout, err)
+		os.Exit(2)
+	}
+
+	if len(*watchedDir) > 0 && len(*watchedDirs) > 0 {
+		fmt.Fprintln(os.Stderr, "Error: --watched-dir and --watched-dirs are mutually exclusive")
+		os.Exit(2)
+	}
+
+	// Validate that max-recursion-depth is only used with watchedDirs
+	if *maxRecursionDepth != 0 && len(*watchedDirs) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: --max-recursion-depth can only be used with --watched-dirs")
 		os.Exit(2)
 	}
 
@@ -160,11 +182,22 @@ func main() {
 		opts := reloader.Options{
 			CfgFile:                       *cfgFile,
 			CfgOutputFile:                 *cfgSubstFile,
-			WatchedDirs:                   *watchedDir,
 			DelayInterval:                 *delayInterval,
 			WatchInterval:                 *watchInterval,
 			RetryInterval:                 *retryInterval,
 			TolerateEnvVarExpansionErrors: true,
+		}
+
+		if len(*watchedDirs) > 0 {
+			// Recursively find all directories within the specified watched directories
+			allDirs, err := findDirectoriesRecursively(*watchedDirs, *maxRecursionDepth, logger)
+			if err != nil {
+				logger.Error("Failed to find directories recursively", "err", err)
+				os.Exit(1)
+			}
+			opts.WatchedDirs = allDirs
+		} else {
+			opts.WatchedDirs = *watchedDir
 		}
 
 		switch *reloadMethod {
@@ -252,4 +285,41 @@ func createOrdinalEnvvar(fromName string) error {
 	reg := regexp.MustCompile(`\d+$`)
 	val := reg.FindString(os.Getenv(fromName))
 	return os.Setenv(statefulsetOrdinalEnvvar, val)
+}
+
+func findDirectoriesRecursively(dirs []string, maxDepth int, logger *slog.Logger) ([]string, error) {
+	var allDirs []string
+
+	var walk func(string, int) error
+	walk = func(path string, depth int) error {
+		if depth > maxDepth {
+			return nil
+		}
+
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			logger.Warn("Failed to read directory", "path", path, "err", err)
+			return nil // Continue with other directories instead of failing completely
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				fullPath := filepath.Join(path, entry.Name())
+				allDirs = append(allDirs, fullPath)
+				if err := walk(fullPath, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	}
+
+	for _, dir := range dirs {
+		if err := walk(dir, 0); err != nil {
+			return nil, err
+		}
+	}
+
+	return allDirs, nil
 }
